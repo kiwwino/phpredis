@@ -343,31 +343,70 @@ PS_READ_FUNC(redis)
 {
     char *session, *cmd;
     int session_len, cmd_len;
+    int redundancy = 2;
+    int redundancy_step = 0;
 
     redis_pool *pool = PS_GET_MOD_DATA();
-    redis_pool_member *rpm = redis_pool_get_sock(pool, key TSRMLS_CC);
-    RedisSock *redis_sock = rpm?rpm->redis_sock:NULL;
-    if(!rpm || !redis_sock){
-        return FAILURE;
-    }
 
-    /* send GET command */
-    session = redis_session_key(rpm, key, strlen(key), &session_len);
-    cmd_len = redis_cmd_format_static(&cmd, "GET", "s", session, session_len);
-    
-    efree(session);
-    if(redis_sock_write(redis_sock, cmd, cmd_len TSRMLS_CC) < 0) {
-        efree(cmd);
-        return FAILURE;
-    }
-    efree(cmd);
+    if (redundancy > 1) {
+        redis_pool_member *rpm, *next;
+        rpm = pool->head;
 
-    /* read response */
-    if ((*val = redis_sock_read(redis_sock, vallen TSRMLS_CC)) == NULL) {
-        return FAILURE;
-    }
+        while(rpm && redundancy_step < redundancy) {
+            int needs_auth = 0;
+            if(rpm->auth && rpm->auth_len && rpm->redis_sock->status != REDIS_SOCK_STATUS_CONNECTED) {
+                   needs_auth = 1;
+            }
 
+            RedisSock *redis_sock = rpm?rpm->redis_sock:NULL;
+            if (redis_sock_server_open(rpm->redis_sock, 0 TSRMLS_CC) == 0) {
+
+	        if(needs_auth) {
+		    redis_pool_member_auth(rpm TSRMLS_CC);
+		}
+		if(rpm->database >= 0) { /* default is -1 which leaves the choice to redis. */
+		    redis_pool_member_select(rpm TSRMLS_CC);
+		}
+
+                session = redis_session_key(rpm, key, strlen(key), &session_len);
+                cmd_len = redis_cmd_format_static(&cmd, "GET", "s", session, session_len);
+                efree(session);
+                redis_sock_write(redis_sock, cmd, cmd_len TSRMLS_CC); 
+                efree(cmd);
+
+                if ((*val = redis_sock_read(redis_sock, vallen TSRMLS_CC)) != NULL) {
+                    return SUCCESS; 
+                }
+
+           }
+           next = rpm->next;
+           rpm = next;
+           redundancy_step++;
+         }
+    } else {
+	    redis_pool_member *rpm = redis_pool_get_sock(pool, key TSRMLS_CC);
+	    RedisSock *redis_sock = rpm?rpm->redis_sock:NULL;
+	    if(!rpm || !redis_sock){
+		return FAILURE;
+	    }
+
+	    /* send GET command */
+	    session = redis_session_key(rpm, key, strlen(key), &session_len);
+	    cmd_len = redis_cmd_format_static(&cmd, "GET", "s", session, session_len);
+	    
+	    efree(session);
+	    if(redis_sock_write(redis_sock, cmd, cmd_len TSRMLS_CC) < 0) {
+		efree(cmd);
+		return FAILURE;
+	    }
+	    efree(cmd);
+
+	    /* read response */
+	    if ((*val = redis_sock_read(redis_sock, vallen TSRMLS_CC)) == NULL) {
+		return FAILURE;
+	    }
     return SUCCESS;
+    }
 }
 /* }}} */
 
@@ -377,38 +416,89 @@ PS_WRITE_FUNC(redis)
 {
     char *cmd, *response, *session;
     int cmd_len, response_len, session_len;
+    int redundancy = 2;
+    int redundancy_step = 0;
 
     redis_pool *pool = PS_GET_MOD_DATA();
-    redis_pool_member *rpm = redis_pool_get_sock(pool, key TSRMLS_CC);
-    RedisSock *redis_sock = rpm?rpm->redis_sock:NULL;
-    if(!rpm || !redis_sock){
-        return FAILURE;
-    }
 
-    /* send SET command */
-    session = redis_session_key(rpm, key, strlen(key), &session_len);
-    cmd_len = redis_cmd_format_static(&cmd, "SETEX", "sds", session,
-                                      session_len,
-                                      INI_INT("session.gc_maxlifetime"),
-                                      val, vallen);
-    efree(session);
-    if(redis_sock_write(redis_sock, cmd, cmd_len TSRMLS_CC) < 0) {
-        efree(cmd);
-        return FAILURE;
-    }
-    efree(cmd);
 
-    /* read response */
-    if ((response = redis_sock_read(redis_sock, &response_len TSRMLS_CC)) == NULL) {
-        return FAILURE;
-    }
+    if (redundancy > 1) {
+        redis_pool_member *rpm, *next;
+        rpm = pool->head;
 
-    if(response_len == 3 && strncmp(response, "+OK", 3) == 0) {
-        efree(response);
+        while(rpm && redundancy_step < redundancy) {
+            int needs_auth = 0;
+            if(rpm->auth && rpm->auth_len && rpm->redis_sock->status != REDIS_SOCK_STATUS_CONNECTED) {
+                    needs_auth = 1;
+            }
+
+            RedisSock *redis_sock = rpm?rpm->redis_sock:NULL;
+            if (redis_sock_server_open(rpm->redis_sock, 0 TSRMLS_CC) == 0) {
+
+                if(needs_auth) {
+                    redis_pool_member_auth(rpm TSRMLS_CC);
+                }
+                if(rpm->database >= 0) { /* default is -1 which leaves the choice to redis. */
+                    redis_pool_member_select(rpm TSRMLS_CC);
+                }
+
+                session = redis_session_key(rpm, key, strlen(key), &session_len);
+                cmd_len = redis_cmd_format_static(&cmd, "SETEX", "sds", session, session_len, INI_INT("session.gc_maxlifetime"), val, vallen);
+                efree(session);
+
+                redis_sock_write(redis_sock, cmd, cmd_len TSRMLS_CC);
+                efree(cmd);
+
+                response = redis_sock_read(redis_sock, &response_len TSRMLS_CC); 
+
+                if(response_len == 3 && strncmp(response, "+OK", 3) == 0) {
+                        efree(response);
+                //      return SUCCESS;
+                } else {
+                        efree(response);
+                        //return FAILURE;
+                }
+
+             }
+             next = rpm->next;
+             rpm = next;
+             redundancy_step++;
+         
+          }
         return SUCCESS;
     } else {
-        efree(response);
-        return FAILURE;
+
+	    redis_pool_member *rpm = redis_pool_get_sock(pool, key TSRMLS_CC);
+	    RedisSock *redis_sock = rpm?rpm->redis_sock:NULL;
+	    if(!rpm || !redis_sock){
+		return FAILURE;
+	    }
+
+	    /* send SET command */
+	    session = redis_session_key(rpm, key, strlen(key), &session_len);
+	    cmd_len = redis_cmd_format_static(&cmd, "SETEX", "sds", session,
+					      session_len,
+					      INI_INT("session.gc_maxlifetime"),
+					      val, vallen);
+	    efree(session);
+	    if(redis_sock_write(redis_sock, cmd, cmd_len TSRMLS_CC) < 0) {
+		efree(cmd);
+		return FAILURE;
+	    }
+	    efree(cmd);
+
+	    /* read response */
+	    if ((response = redis_sock_read(redis_sock, &response_len TSRMLS_CC)) == NULL) {
+		return FAILURE;
+	    }
+
+	    if(response_len == 3 && strncmp(response, "+OK", 3) == 0) {
+		efree(response);
+		return SUCCESS;
+	    } else {
+		efree(response);
+		return FAILURE;
+	    }
     }
 }
 /* }}} */
